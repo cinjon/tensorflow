@@ -631,6 +631,8 @@ def _compute_sampled_logits(weights, biases, inputs, labels, num_sampled,
     all_w = embedding_ops.embedding_lookup(
         weights, all_ids, partition_strategy=partition_strategy)
     all_b = embedding_ops.embedding_lookup(biases, all_ids)
+    all_b = math_ops.cast(all_b, dtypes.float32)
+
     # true_w shape is [batch_size * num_true, dim]
     # true_b is a [batch_size * num_true] tensor
     true_w = array_ops.slice(
@@ -651,6 +653,8 @@ def _compute_sampled_logits(weights, biases, inputs, labels, num_sampled,
                                        array_ops.concat(0, [[-1], dim]))
     true_logits = array_ops.reshape(_sum_rows(dots_as_matrix), [-1, num_true])
     true_b = array_ops.reshape(true_b, [-1, num_true])
+    # true_b = array_ops.reshape(math_ops.cast(true_b, dtypes.float32),
+    #                            [-1, num_true])
     true_logits += true_b
 
     # Lookup weights and biases for sampled labels.
@@ -666,7 +670,8 @@ def _compute_sampled_logits(weights, biases, inputs, labels, num_sampled,
     # Apply X*W'+B, which yields [batch_size, num_sampled]
     sampled_logits = math_ops.matmul(inputs,
                                      sampled_w,
-                                     transpose_b=True) + sampled_b
+                                     transpose_b=True)
+    sampled_logits += sampled_b
 
     if remove_accidental_hits:
       acc_hits = candidate_sampling_ops.compute_accidental_hits(
