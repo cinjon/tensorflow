@@ -143,7 +143,7 @@ def tied_rnn_seq2seq(encoder_inputs, decoder_inputs, cell,
 
 def embedding_rnn_decoder(decoder_inputs, initial_state, cell, num_symbols,
                           output_projection=None, feed_previous=False,
-                          scope=None):
+                          scope=None, embedding=None):
   """RNN decoder with embedding and a pure-decoding option.
 
   Args:
@@ -360,7 +360,8 @@ def embedding_tied_rnn_seq2seq(encoder_inputs, decoder_inputs, cell,
 
 def attention_decoder(decoder_inputs, initial_state, attention_states, cell,
                       output_size=None, num_heads=1, loop_function=None,
-                      dtype=dtypes.float32, scope=None):
+                      dtype=dtypes.float32, scope=None, module=None,
+                      attention_funcs=None):
   """RNN decoder with attention for the sequence-to-sequence model.
 
   Args:
@@ -380,6 +381,9 @@ def attention_decoder(decoder_inputs, initial_state, attention_states, cell,
         * next is a 2D Tensor of shape [batch_size x cell.input_size].
     dtype: The dtype to use for the RNN initial state (default: tf.float32).
     scope: VariableScope for the created subgraph; default: "attention_decoder".
+    module: String used by attention decoder to condition an attention function.
+    attention_funcs: The attention functions built upstream and passed through.
+      This is done to not be entangled in the downstream scope.
 
   Returns:
     outputs: A list of the same length as decoder_inputs of 2D Tensors of shape
@@ -412,42 +416,15 @@ def attention_decoder(decoder_inputs, initial_state, attention_states, cell,
 
   with vs.variable_scope(scope or "attention_decoder"):
     batch_size = array_ops.shape(decoder_inputs[0])[0]  # Needed for reshaping.
-    attn_length = attention_states.get_shape()[1].value
-    attn_size = attention_states.get_shape()[2].value
 
-    # To calculate W1 * h_t we use a 1-by-1 convolution, need to reshape before.
-    hidden = array_ops.reshape(
-        attention_states, [-1, attn_length, 1, attn_size])
-    hidden_features = []
-    v = []
-    attention_vec_size = attn_size  # Size of query vectors for attention.
-    for a in xrange(num_heads):
-      k = vs.get_variable("AttnW_%d" % a, [1, 1, attn_size, attention_vec_size])
-      hidden_features.append(nn_ops.conv2d(hidden, k, [1, 1, 1, 1], "SAME"))
-      v.append(vs.get_variable("AttnV_%d" % a, [attention_vec_size]))
+    attention_func = attention_module(attention_states, None, num_heads)
 
     states = [initial_state]
 
-    def attention(query):
-      """Put attention masks on hidden using hidden_features and query."""
-      ds = []  # Results of attention reads will be stored here.
-      for a in xrange(num_heads):
-        with vs.variable_scope("Attention_%d" % a):
-          y = rnn_cell.linear(query, attention_vec_size, True)
-          y = array_ops.reshape(y, [-1, 1, 1, attention_vec_size])
-          # Attention mask is a softmax of v^T * tanh(...).
-          s = math_ops.reduce_sum(
-              v[a] * math_ops.tanh(hidden_features[a] + y), [2, 3])
-          a = nn_ops.softmax(s)
-          # Now calculate the attention-weighted vector d.
-          d = math_ops.reduce_sum(
-              array_ops.reshape(a, [-1, attn_length, 1, 1]) * hidden,
-              [1, 2])
-          ds.append(array_ops.reshape(d, [-1, attn_size]))
-      return ds
-
     outputs = []
     prev = None
+    attn_length = attention_states.get_shape()[1].value
+    attn_size = attention_states.get_shape()[2].value
     batch_attn_size = array_ops.pack([batch_size, attn_size])
     attns = [array_ops.zeros(batch_attn_size, dtype=dtype)
              for _ in xrange(num_heads)]
@@ -466,8 +443,22 @@ def attention_decoder(decoder_inputs, initial_state, attention_states, cell,
       # Run the RNN.
       cell_output, new_state = cell(x, states[-1])
       states.append(new_state)
+
       # Run the attention mechanism.
-      attns = attention(new_state)
+      if attention_funcs:
+        # Build a conditional satisfied by the current module.
+        num = 0
+        for m, func in attention_funcs.iteritems():
+          if num == 0:
+            attns = func(new_state)
+          else:
+            attns = control_flow_ops.cond(
+              module == m, lambda: func(new_state), lambda: attns)
+        num += 1
+      else:
+        # The usual attention function
+        attns = attention_func(new_state)
+
       with vs.variable_scope("AttnOutputProjection"):
         output = rnn_cell.linear([cell_output] + attns, output_size, True)
       if loop_function is not None:
@@ -478,11 +469,56 @@ def attention_decoder(decoder_inputs, initial_state, attention_states, cell,
   return outputs, states
 
 
+def attention_module(attention_states, module=None, num_heads=1):
+    attn_length = attention_states.get_shape()[1].value
+    attn_size = attention_states.get_shape()[2].value
+
+    # To calculate W1 * h_t we use a 1-by-1 convolution, need to reshape before.
+    hidden = array_ops.reshape(
+        attention_states, [-1, attn_length, 1, attn_size])
+    hidden_features = []
+    v = []
+    for a in xrange(num_heads):
+      k_scope = 'AttnW_%d' % a
+      v_scope = 'AttnV_%d' % a
+      if module:
+        k_scope += '_%s' % module
+        v_scope += '_%s' % module
+
+      k = vs.get_variable(k_scope, [1, 1, attn_size, attn_size])
+      hidden_features.append(nn_ops.conv2d(hidden, k, [1, 1, 1, 1], "SAME"))
+      v.append(vs.get_variable(v_scope, [attn_size]))
+
+    def attention(query):
+      """Put attention masks on hidden using hidden_features and query."""
+      ds = []  # Results of attention reads will be stored here.
+      attn_scope = 'Attention'
+      if module:
+        attn_scope += '_%s' % module
+
+      for a in xrange(num_heads):
+        with vs.variable_scope("%s_%d" % (attn_scope, a)):
+          y = rnn_cell.linear(query, attn_size, True)
+          y = array_ops.reshape(y, [-1, 1, 1, attn_size])
+          # Attention mask is a softmax of v^T * tanh(...).
+          s = math_ops.reduce_sum(
+              v[a] * math_ops.tanh(hidden_features[a] + y), [2, 3])
+          a = nn_ops.softmax(s)
+          # Now calculate the attention-weighted vector d.
+          d = math_ops.reduce_sum(
+              array_ops.reshape(a, [-1, attn_length, 1, 1]) * hidden,
+              [1, 2])
+          ds.append(array_ops.reshape(d, [-1, attn_size]))
+      return ds
+
+    return attention
+
 def embedding_attention_decoder(decoder_inputs, initial_state, attention_states,
                                 cell, num_symbols, num_heads=1,
                                 output_size=None, output_projection=None,
                                 feed_previous=False, dtype=dtypes.float32,
-                                scope=None):
+                                scope=None, module=None, attention_funcs=None,
+                                embedding=None):
   """RNN decoder with embedding and attention and a pure-decoding option.
 
   Args:
@@ -506,6 +542,11 @@ def embedding_attention_decoder(decoder_inputs, initial_state, attention_states,
     dtype: The dtype to use for the RNN initial states (default: tf.float32).
     scope: VariableScope for the created subgraph; defaults to
       "embedding_attention_decoder".
+    module: String used by attention decoder to condition an attention function.
+    attention_funcs: The attention functions built upstream and passed through.
+      This is done to not be entangled in the downstream scope.
+    embedding: The embedding for the decoder. This is passed through the seq2seq
+      pipeline.
 
   Returns:
     outputs: A list of the same length as decoder_inputs of 2D Tensors with
@@ -528,7 +569,8 @@ def embedding_attention_decoder(decoder_inputs, initial_state, attention_states,
 
   with vs.variable_scope(scope or "embedding_attention_decoder"):
     with ops.device("/cpu:0"):
-      embedding = vs.get_variable("embedding", [num_symbols, cell.input_size])
+      if not embedding:
+        embedding = vs.get_variable("embedding", [num_symbols, cell.input_size])
 
     def extract_argmax_and_embed(prev, _):
       """Loop_function that extracts the symbol from prev and embeds it."""
@@ -546,15 +588,17 @@ def embedding_attention_decoder(decoder_inputs, initial_state, attention_states,
     emb_inp = [
         embedding_ops.embedding_lookup(embedding, i) for i in decoder_inputs]
     return attention_decoder(
-        emb_inp, initial_state, attention_states, cell, output_size=output_size,
-        num_heads=num_heads, loop_function=loop_function)
+      emb_inp, initial_state, attention_states, cell, output_size=output_size,
+      num_heads=num_heads, loop_function=loop_function, module=module,
+      attention_funcs=attention_funcs)
 
 
 def embedding_attention_seq2seq(encoder_inputs, decoder_inputs, cell,
                                 num_encoder_symbols, num_decoder_symbols,
                                 num_heads=1, output_projection=None,
                                 feed_previous=False, dtype=dtypes.float32,
-                                scope=None):
+                                scope=None, module=None, encoder_cell=None,
+                                modules=None, embedding=None):
   """Embedding sequence-to-sequence model with attention.
 
   This model first embeds encoder_inputs by a newly created embedding (of shape
@@ -583,6 +627,12 @@ def embedding_attention_seq2seq(encoder_inputs, decoder_inputs, cell,
     dtype: The dtype of the initial RNN state (default: tf.float32).
     scope: VariableScope for the created subgraph; defaults to
       "embedding_attention_seq2seq".
+    module: String used by attention decoder to condition an attention function.
+    encoder_cell: The EmbeddingWrapper for the encoder.
+    modules: List of all possible string modules. Used to build the attention
+      functions up front for inference later on.
+    embedding: The embedding for the decoder. This is passed through the seq2seq
+      pipeline.
 
   Returns:
     outputs: A list of the same length as decoder_inputs of 2D Tensors with
@@ -592,16 +642,25 @@ def embedding_attention_seq2seq(encoder_inputs, decoder_inputs, cell,
       Each item is a 2D Tensor of shape [batch_size x cell.state_size].
   """
   with vs.variable_scope(scope or "embedding_attention_seq2seq"):
-    # Encoder.
-    encoder_cell = rnn_cell.EmbeddingWrapper(cell, num_encoder_symbols)
-    encoder_outputs, encoder_states = rnn.rnn(
-        encoder_cell, encoder_inputs, dtype=dtype)
+    if not encoder_cell:
+      # Encoder
+      encoder_cell = rnn_cell.EmbeddingWrapper(cell, num_encoder_symbols)
 
-    # First calculate a concatenation of encoder outputs to put attention on.
-    top_states = [array_ops.reshape(e, [-1, 1, cell.output_size])
-                  for e in encoder_outputs]
-    attention_states = array_ops.concat(1, top_states)
+  encoder_outputs, encoder_states = rnn.rnn(
+    encoder_cell, encoder_inputs, dtype=dtype)
 
+  # First calculate a concatenation of encoder outputs to put attention on.
+  top_states = [array_ops.reshape(e, [-1, 1, cell.output_size])
+                for e in encoder_outputs]
+  attention_states = array_ops.concat(1, top_states)
+  attention_funcs = None
+  if modules:
+    # Build the attention_funcs upfront so that they aren't in the seq2seq scope.
+    attention_funcs = {
+      m:attention_module(attention_states, m, num_heads) for m in modules
+      }
+
+  with vs.variable_scope(scope or "embedding_attention_seq2seq"):
     # Decoder.
     output_size = None
     if output_projection is None:
@@ -610,17 +669,20 @@ def embedding_attention_seq2seq(encoder_inputs, decoder_inputs, cell,
 
     if isinstance(feed_previous, bool):
       return embedding_attention_decoder(
-          decoder_inputs, encoder_states[-1], attention_states, cell,
-          num_decoder_symbols, num_heads, output_size, output_projection,
-          feed_previous)
+        decoder_inputs, encoder_states[-1], attention_states, cell,
+        num_decoder_symbols, num_heads, output_size, output_projection,
+        feed_previous, module=module, attention_funcs=attention_funcs,
+        embedding=embedding)
     else:  # If feed_previous is a Tensor, we construct 2 graphs and use cond.
       outputs1, states1 = embedding_attention_decoder(
-          decoder_inputs, encoder_states[-1], attention_states, cell,
-          num_decoder_symbols, num_heads, output_size, output_projection, True)
+        decoder_inputs, encoder_states[-1], attention_states, cell,
+        num_decoder_symbols, num_heads, output_size, output_projection, True,
+        module=module, attention_funcs=attention_funcs, embedding=embedding)
       vs.get_variable_scope().reuse_variables()
       outputs2, states2 = embedding_attention_decoder(
-          decoder_inputs, encoder_states[-1], attention_states, cell,
-          num_decoder_symbols, num_heads, output_size, output_projection, False)
+        decoder_inputs, encoder_states[-1], attention_states, cell,
+        num_decoder_symbols, num_heads, output_size, output_projection, False,
+        module=module, attention_funcs=attention_funcs, embedding=embedding)
 
       outputs = control_flow_ops.cond(feed_previous,
                                       lambda: outputs1, lambda: outputs2)
