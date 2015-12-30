@@ -101,17 +101,17 @@ def rnn(cell, inputs, initial_state=None, dtype=None,
       max_sequence_length = math_ops.reduce_max(sequence_length)
 
     for time, input_ in enumerate(inputs):
-      if time > 0: vs.get_variable_scope().reuse_variables()
-      # pylint: disable=cell-var-from-loop
-      def output_state():
-        return cell(input_, state)
-      # pylint: enable=cell-var-from-loop
-      if sequence_length:
-        (output, state) = control_flow_ops.cond(
+      with vs.variable_scope('cell_output', reuse=True if time > 0 else None):
+        # pylint: disable=cell-var-from-loop
+        def output_state():
+          return cell(input_, state)
+        # pylint: enable=cell-var-from-loop
+        if sequence_length:
+          (output, state) = control_flow_ops.cond(
             time >= max_sequence_length,
             lambda: zero_output_state, output_state)
-      else:
-        (output, state) = output_state()
+        else:
+          (output, state) = output_state()
 
       outputs.append(output)
       states.append(state)
